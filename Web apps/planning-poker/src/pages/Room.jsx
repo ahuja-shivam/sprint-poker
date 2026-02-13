@@ -9,8 +9,10 @@ const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 export default function Room() {
     const { roomId } = useParams()
     const [searchParams] = useSearchParams()
-    const isHost = searchParams.get('host') === 'true'
     const { session } = useAuth()
+
+    // Only allow host mode if the user is actually logged in
+    const isHost = searchParams.get('host') === 'true' && !!session
 
     const [participants, setParticipants] = useState([])
     const [votes, setVotes] = useState({})
