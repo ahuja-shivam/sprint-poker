@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../components/AuthContext'
-import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown } from 'lucide-react'
+import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play } from 'lucide-react'
 
 const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 
@@ -23,6 +23,8 @@ export default function Room() {
     const [guestName, setGuestName] = useState('')
     const [hasJoined, setHasJoined] = useState(false)
     const [hostName, setHostName] = useState('')
+    const [tickets, setTickets] = useState([])
+    const [currentTicketId, setCurrentTicketId] = useState(null)
     const joinCalledRef = useRef(false)
 
     // Determine if we need a name prompt (guest flow)
@@ -39,49 +41,45 @@ export default function Room() {
         }
 
         // Guard against React StrictMode double-mount
-        if (joinCalledRef.current) return
+        if (joinCalledRef.current) {
+            setHasJoined(true)
+            return
+        }
         joinCalledRef.current = true
 
         const name = sessionStorage.getItem('poker_guest_name') || 'Guest'
         const participantKey = `poker_participant_${roomId}`
 
         const joinRoom = async () => {
-            // Check if we already have a participant ID for this room
             const existingId = sessionStorage.getItem(participantKey)
             if (existingId) {
-                const { data } = await supabase
+                const { data: existing } = await supabase
                     .from('participants')
                     .select('id')
                     .eq('id', existingId)
                     .single()
-
-                if (data) {
-                    setMyParticipantId(existingId)
+                if (existing) {
+                    setMyParticipantId(existing.id)
                     setHasJoined(true)
                     return
                 }
-                sessionStorage.removeItem(participantKey)
             }
 
-            // Insert new participant
             const { data, error } = await supabase
                 .from('participants')
                 .insert([{ room_id: roomId, name }])
                 .select()
                 .single()
 
-            if (error) {
-                console.error('Failed to join:', error)
-                return
+            if (data) {
+                setMyParticipantId(data.id)
+                sessionStorage.setItem(participantKey, data.id)
             }
-
-            sessionStorage.setItem(participantKey, data.id)
-            setMyParticipantId(data.id)
             setHasJoined(true)
         }
 
         joinRoom()
-    }, [roomId, isHost, needsName])
+    }, [roomId, needsName, isHost])
 
     // Subscribe to real-time updates
     useEffect(() => {
@@ -93,11 +91,12 @@ export default function Room() {
         const fetchState = async () => {
             const { data: room } = await supabase
                 .from('rooms')
-                .select('is_revealed, host_id, host_vote')
+                .select('is_revealed, host_id, host_vote, current_ticket_id')
                 .eq('id', roomId)
                 .single()
             if (room) {
                 setIsRevealed(room.is_revealed)
+                setCurrentTicketId(room.current_ticket_id)
                 // Fetch host name
                 if (room.host_id) {
                     const { data: hostUser } = await supabase
@@ -135,6 +134,14 @@ export default function Room() {
             }
             setVotes(voteMap)
 
+            // Fetch tickets
+            const { data: ticketData } = await supabase
+                .from('tickets')
+                .select('*')
+                .eq('room_id', roomId)
+                .order('position', { ascending: true })
+            if (ticketData) setTickets(ticketData)
+
             initialFetchDone = true
         }
 
@@ -144,6 +151,7 @@ export default function Room() {
             .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, (payload) => {
                 if (payload.new) {
                     setIsRevealed(payload.new.is_revealed)
+                    setCurrentTicketId(payload.new.current_ticket_id)
                     // Sync host vote from DB
                     if (payload.new.host_vote !== null && payload.new.host_vote !== undefined) {
                         setVotes((prev) => ({ ...prev, host: payload.new.host_vote }))
@@ -157,7 +165,7 @@ export default function Room() {
                 }
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'participants', filter: `room_id=eq.${roomId}` }, (payload) => {
-                if (!initialFetchDone) return // ignore events before initial fetch
+                if (!initialFetchDone) return
                 if (payload.eventType === 'INSERT') {
                     setParticipants((prev) => {
                         if (prev.some((p) => p.id === payload.new.id)) return prev
@@ -176,6 +184,18 @@ export default function Room() {
                         delete copy[payload.old.participant_id]
                         return copy
                     })
+                }
+            })
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets', filter: `room_id=eq.${roomId}` }, (payload) => {
+                if (payload.eventType === 'INSERT') {
+                    setTickets((prev) => {
+                        if (prev.some(t => t.id === payload.new.id)) return prev
+                        return [...prev, payload.new].sort((a, b) => a.position - b.position)
+                    })
+                } else if (payload.eventType === 'UPDATE') {
+                    setTickets((prev) => prev.map(t => t.id === payload.new.id ? payload.new : t))
+                } else if (payload.eventType === 'DELETE') {
+                    setTickets((prev) => prev.filter(t => t.id !== payload.old.id))
                 }
             })
             .subscribe((status) => {
@@ -215,6 +235,51 @@ export default function Room() {
             .from('rooms')
             .update({ is_revealed: true })
             .eq('id', roomId)
+
+        // Calculate average and save to current ticket
+        if (currentTicketId) {
+            const voteVals = Object.values(votes).filter(v => v !== null && v !== undefined)
+            if (voteVals.length > 0) {
+                const avg = parseFloat((voteVals.reduce((a, b) => a + b, 0) / voteVals.length).toFixed(1))
+                await supabase
+                    .from('tickets')
+                    .update({ avg_score: avg, status: 'completed' })
+                    .eq('id', currentTicketId)
+            }
+        }
+    }
+
+    const handleNextTicket = async () => {
+        // Find the next pending ticket
+        const currentIndex = tickets.findIndex(t => t.id === currentTicketId)
+        const nextTicket = tickets.find((t, i) => i > currentIndex && t.status === 'pending')
+
+        if (!nextTicket) {
+            // No more tickets — just reset for a free round
+            await handleReset()
+            return
+        }
+
+        // Update next ticket status to active
+        await supabase
+            .from('tickets')
+            .update({ status: 'active' })
+            .eq('id', nextTicket.id)
+
+        // Reset the room for a new round
+        setIsRevealed(false)
+        setMyVote(null)
+        setVotes({})
+
+        await supabase
+            .from('rooms')
+            .update({ is_revealed: false, host_vote: null, current_ticket_id: nextTicket.id })
+            .eq('id', roomId)
+
+        await supabase
+            .from('votes')
+            .delete()
+            .eq('room_id', roomId)
     }
 
     const handleReset = async () => {
@@ -245,7 +310,7 @@ export default function Room() {
         e.preventDefault()
         if (!guestName.trim()) return
         sessionStorage.setItem('poker_guest_name', guestName.trim())
-        setHasJoined(false) // triggers the join useEffect
+        setHasJoined(false)
         window.location.reload()
     }
 
@@ -288,6 +353,14 @@ export default function Room() {
     const hostEntry = hostName ? { id: 'host', name: hostName, isHost: true } : null
     const allPlayers = hostEntry ? [hostEntry, ...participants] : participants
 
+    // ── Get current ticket info ──
+    const currentTicket = tickets.find(t => t.id === currentTicketId)
+    const completedCount = tickets.filter(t => t.status === 'completed').length
+    const hasMoreTickets = tickets.some((t, i) => {
+        const curIdx = tickets.findIndex(tk => tk.id === currentTicketId)
+        return i > curIdx && t.status === 'pending'
+    })
+
     // ── Calculate average ──
     const voteValues = Object.values(votes).filter((v) => v !== null && v !== undefined)
     const average = voteValues.length > 0
@@ -299,7 +372,7 @@ export default function Room() {
         <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-indigo-950 flex flex-col">
             {/* Header */}
             <header className="border-b border-white/10 backdrop-blur-sm bg-white/5 shrink-0">
-                <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+                <div className="max-w-full mx-auto px-4 py-3 flex items-center justify-between">
                     <div className="flex items-center gap-3">
                         <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center">
                             <Spade className="w-4 h-4 text-white" />
@@ -311,6 +384,11 @@ export default function Room() {
                     </div>
 
                     <div className="flex items-center gap-2">
+                        {tickets.length > 0 && (
+                            <span className="text-xs text-slate-400 px-2 py-1 rounded-lg bg-white/5">
+                                {completedCount}/{tickets.length} done
+                            </span>
+                        )}
                         {isHost && (
                             <button
                                 onClick={copyLink}
@@ -326,8 +404,8 @@ export default function Room() {
 
             {/* Main Content */}
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
-                {/* Participants Sidebar */}
-                <aside className="lg:w-72 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto">
+                {/* Participants Sidebar - Left */}
+                <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto">
                     <div className="flex items-center gap-2 text-slate-400 mb-3">
                         <Users className="w-4 h-4" />
                         <span className="text-xs font-medium uppercase tracking-wider">
@@ -376,13 +454,26 @@ export default function Room() {
 
                 {/* Center Area */}
                 <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
+                    {/* Current Ticket Banner */}
+                    {currentTicket && (
+                        <div className="w-full max-w-lg px-4 py-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
+                            <div className="flex items-center gap-2 mb-1">
+                                <Ticket className="w-4 h-4 text-indigo-400" />
+                                <span className="text-xs text-indigo-300 font-mono font-bold">{currentTicket.ticket_id}</span>
+                            </div>
+                            {currentTicket.description && (
+                                <p className="text-sm text-slate-300 leading-relaxed">{currentTicket.description}</p>
+                            )}
+                        </div>
+                    )}
+
                     {/* Status */}
                     <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 border border-white/10">
                         <Clock className="w-4 h-4 text-slate-400" />
                         <span className="text-sm text-slate-300">
                             {isRevealed
                                 ? `Results: Average is ${average || '—'}`
-                                : `${voteValues.length} / ${participants.length} voted`
+                                : `${voteValues.length} / ${allPlayers.length} voted`
                             }
                         </span>
                     </div>
@@ -427,17 +518,92 @@ export default function Room() {
                                     Reveal Cards
                                 </button>
                             ) : (
-                                <button
-                                    onClick={handleReset}
-                                    className="flex items-center gap-2 px-6 py-3 rounded-xl bg-white/10 border border-white/20 text-slate-300 hover:text-white hover:bg-white/20 transition-all"
-                                >
-                                    <RotateCcw className="w-5 h-5" />
-                                    New Round
-                                </button>
+                                <>
+                                    {hasMoreTickets ? (
+                                        <button
+                                            onClick={handleNextTicket}
+                                            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 transition-all shadow-lg shadow-indigo-500/25"
+                                        >
+                                            <ChevronRight className="w-5 h-5" />
+                                            Next Ticket
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={handleReset}
+                                            className="flex items-center gap-2 px-6 py-3 rounded-xl bg-white/10 border border-white/20 text-slate-300 hover:text-white hover:bg-white/20 transition-all"
+                                        >
+                                            <RotateCcw className="w-5 h-5" />
+                                            New Round
+                                        </button>
+                                    )}
+                                </>
                             )}
                         </div>
                     )}
                 </div>
+
+                {/* Tickets Sidebar - Right */}
+                {tickets.length > 0 && (
+                    <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto">
+                        <div className="p-4">
+                            <div className="flex items-center gap-2 text-slate-400 mb-3">
+                                <Hash className="w-4 h-4" />
+                                <span className="text-xs font-medium uppercase tracking-wider">
+                                    Tickets ({completedCount}/{tickets.length})
+                                </span>
+                            </div>
+                            <div className="space-y-1.5">
+                                {tickets.map((ticket) => {
+                                    const isActive = ticket.id === currentTicketId
+                                    const isCompleted = ticket.status === 'completed'
+                                    return (
+                                        <div
+                                            key={ticket.id}
+                                            className={`p-3 rounded-xl transition-all ${isActive
+                                                ? 'bg-indigo-500/15 border border-indigo-500/30'
+                                                : isCompleted
+                                                    ? 'bg-emerald-500/5 border border-emerald-500/10'
+                                                    : 'bg-white/[0.03] border border-transparent hover:bg-white/5'
+                                                }`}
+                                        >
+                                            <div className="flex items-start gap-2.5">
+                                                <div className="mt-0.5 shrink-0">
+                                                    {isCompleted ? (
+                                                        <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                                                    ) : isActive ? (
+                                                        <Play className="w-4 h-4 text-indigo-400" />
+                                                    ) : (
+                                                        <Circle className="w-4 h-4 text-slate-600" />
+                                                    )}
+                                                </div>
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="flex items-center justify-between gap-2">
+                                                        <span className={`text-xs font-mono font-bold ${isActive ? 'text-indigo-300' : isCompleted ? 'text-emerald-300' : 'text-slate-400'}`}>
+                                                            {ticket.ticket_id}
+                                                        </span>
+                                                        {isCompleted && ticket.avg_score !== null && (
+                                                            <span className="text-xs font-bold text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                                                                {ticket.avg_score}
+                                                            </span>
+                                                        )}
+                                                        {isActive && (
+                                                            <span className="text-[10px] text-indigo-400 uppercase tracking-wider font-medium">Active</span>
+                                                        )}
+                                                    </div>
+                                                    {ticket.description && (
+                                                        <p className={`text-xs mt-0.5 leading-relaxed ${isActive ? 'text-slate-300' : isCompleted ? 'text-slate-500' : 'text-slate-500'}`}>
+                                                            {ticket.description}
+                                                        </p>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )
+                                })}
+                            </div>
+                        </div>
+                    </aside>
+                )}
             </div>
 
             {/* Voting Hand - Fixed Bottom */}
