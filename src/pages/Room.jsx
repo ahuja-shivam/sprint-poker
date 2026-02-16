@@ -560,7 +560,7 @@ export default function Room() {
             {/* Main Content */}
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
                 {/* Participants Sidebar - Left */}
-                <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto min-h-0">
+                <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
                     <div className="flex items-center gap-2 text-slate-400 mb-3">
                         <Users className="w-4 h-4" />
                         <span className="text-xs font-medium uppercase tracking-wider">
