@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../components/AuthContext'
-import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play } from 'lucide-react'
+import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft } from 'lucide-react'
 
 const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 
@@ -25,10 +25,51 @@ export default function Room() {
     const [hostName, setHostName] = useState('')
     const [tickets, setTickets] = useState([])
     const [currentTicketId, setCurrentTicketId] = useState(null)
+    const [viewingTicketId, setViewingTicketId] = useState(null)
     const joinCalledRef = useRef(false)
 
     // Determine if we need a name prompt (guest flow)
     const needsName = !isHost && !sessionStorage.getItem('poker_guest_name') && !hasJoined
+
+    // The ticket the user is currently viewing (defaults to active ticket)
+    const activeViewTicketId = viewingTicketId || currentTicketId
+    const isViewingActiveTicket = activeViewTicketId === currentTicketId
+    const viewingTicket = tickets.find(t => t.id === activeViewTicketId)
+    const isViewingCompleted = viewingTicket?.status === 'completed'
+
+    // Helper: fetch votes for a specific ticket and update state
+    const fetchVotesForTicket = async (ticketId) => {
+        const { data: allVotes } = await supabase
+            .from('votes')
+            .select('*')
+            .eq('room_id', roomId)
+            .eq('ticket_id', ticketId)
+
+        const voteMap = {}
+        if (allVotes) {
+            allVotes.forEach((v) => {
+                voteMap[v.participant_id] = v.value
+            })
+            const mine = allVotes.find((v) => v.participant_id === myParticipantId)
+            setMyVote(mine ? mine.value : null)
+        } else {
+            setMyVote(null)
+        }
+
+        // Fetch host vote from room (host_vote is per-active-ticket only)
+        if (isViewingActiveTicket || ticketId === currentTicketId) {
+            const { data: room } = await supabase
+                .from('rooms')
+                .select('host_vote')
+                .eq('id', roomId)
+                .single()
+            if (room?.host_vote !== null && room?.host_vote !== undefined) {
+                voteMap.host = room.host_vote
+            }
+        }
+
+        setVotes(voteMap)
+    }
 
     // Join the room
     useEffect(() => {
@@ -114,25 +155,29 @@ export default function Room() {
                 .eq('room_id', roomId)
             if (parts) setParticipants(parts)
 
-            const { data: allVotes } = await supabase
-                .from('votes')
-                .select('*')
-                .eq('room_id', roomId)
+            // Fetch votes for active ticket
+            const ticketToView = room?.current_ticket_id
+            if (ticketToView) {
+                const { data: allVotes } = await supabase
+                    .from('votes')
+                    .select('*')
+                    .eq('room_id', roomId)
+                    .eq('ticket_id', ticketToView)
 
-            // Build complete votes map (participants + host)
-            const voteMap = {}
-            if (allVotes) {
-                allVotes.forEach((v) => {
-                    voteMap[v.participant_id] = v.value
-                })
-                const mine = allVotes.find((v) => v.participant_id === myParticipantId)
-                if (mine) setMyVote(mine.value)
+                const voteMap = {}
+                if (allVotes) {
+                    allVotes.forEach((v) => {
+                        voteMap[v.participant_id] = v.value
+                    })
+                    const mine = allVotes.find((v) => v.participant_id === myParticipantId)
+                    if (mine) setMyVote(mine.value)
+                }
+                // Add host vote
+                if (room?.host_vote !== null && room?.host_vote !== undefined) {
+                    voteMap.host = room.host_vote
+                }
+                setVotes(voteMap)
             }
-            // Add host vote
-            if (room?.host_vote !== null && room?.host_vote !== undefined) {
-                voteMap.host = room.host_vote
-            }
-            setVotes(voteMap)
 
             // Fetch tickets
             const { data: ticketData } = await supabase
@@ -150,8 +195,21 @@ export default function Room() {
             .channel(`room-${roomId}`)
             .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, (payload) => {
                 if (payload.new) {
-                    setIsRevealed(payload.new.is_revealed)
-                    setCurrentTicketId(payload.new.current_ticket_id)
+                    const wasRevealed = payload.old?.is_revealed
+                    const nowRevealed = payload.new.is_revealed
+                    setIsRevealed(nowRevealed)
+
+                    const oldTicketId = payload.old?.current_ticket_id
+                    const newTicketId = payload.new.current_ticket_id
+                    setCurrentTicketId(newTicketId)
+
+                    // New round started (ticket changed or reveal → unrevealed): reset view to active ticket
+                    if ((wasRevealed && !nowRevealed) || (oldTicketId !== newTicketId)) {
+                        setViewingTicketId(null) // snap back to active ticket
+                        setMyVote(null)
+                        setVotes({})
+                    }
+
                     // Sync host vote from DB
                     if (payload.new.host_vote !== null && payload.new.host_vote !== undefined) {
                         setVotes((prev) => ({ ...prev, host: payload.new.host_vote }))
@@ -177,7 +235,14 @@ export default function Room() {
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'votes', filter: `room_id=eq.${roomId}` }, (payload) => {
                 if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-                    setVotes((prev) => ({ ...prev, [payload.new.participant_id]: payload.new.value }))
+                    // Only update local votes if this vote belongs to the ticket we're viewing
+                    const voteTicketId = payload.new.ticket_id
+                    setVotes((prev) => {
+                        // We need to check against activeViewTicketId, but since this is async
+                        // we use the ref-like approach: just always update, the ticket_id check
+                        // is done via the state being reset when switching tickets
+                        return { ...prev, [payload.new.participant_id]: payload.new.value }
+                    })
                 } else if (payload.eventType === 'DELETE') {
                     setVotes((prev) => {
                         const copy = { ...prev }
@@ -212,21 +277,43 @@ export default function Room() {
     const handleVote = async (value) => {
         setMyVote(value)
 
+        const targetTicketId = activeViewTicketId
+
         if (isHost) {
-            setVotes((prev) => ({ ...prev, host: value }))
+            const updatedVotes = { ...votes, host: value }
+            setVotes(updatedVotes)
             await supabase
                 .from('rooms')
                 .update({ host_vote: value })
                 .eq('id', roomId)
+
+            // Recalculate average if already revealed or viewing completed ticket
+            if ((isRevealed || isViewingCompleted) && targetTicketId) {
+                const voteVals = Object.values(updatedVotes).filter(v => v !== null && v !== undefined)
+                if (voteVals.length > 0) {
+                    const avg = parseFloat((voteVals.reduce((a, b) => a + b, 0) / voteVals.length).toFixed(1))
+                    await supabase.from('tickets').update({ avg_score: avg }).eq('id', targetTicketId)
+                }
+            }
             return
         }
 
         await supabase
             .from('votes')
             .upsert(
-                { room_id: roomId, participant_id: myParticipantId, value },
-                { onConflict: 'room_id,participant_id' }
+                { room_id: roomId, participant_id: myParticipantId, ticket_id: targetTicketId, value },
+                { onConflict: 'room_id,ticket_id,participant_id' }
             )
+
+        // Recalculate average if already revealed or viewing completed ticket
+        if ((isRevealed || isViewingCompleted) && targetTicketId) {
+            const updatedVotes = { ...votes, [myParticipantId]: value }
+            const voteVals = Object.values(updatedVotes).filter(v => v !== null && v !== undefined)
+            if (voteVals.length > 0) {
+                const avg = parseFloat((voteVals.reduce((a, b) => a + b, 0) / voteVals.length).toFixed(1))
+                await supabase.from('tickets').update({ avg_score: avg }).eq('id', targetTicketId)
+            }
+        }
     }
 
     const handleReveal = async () => {
@@ -266,36 +353,64 @@ export default function Room() {
             .update({ status: 'active' })
             .eq('id', nextTicket.id)
 
-        // Reset the room for a new round
+        // Reset the room for a new round (don't delete old votes — they're history now)
         setIsRevealed(false)
         setMyVote(null)
         setVotes({})
+        setViewingTicketId(null)
 
         await supabase
             .from('rooms')
             .update({ is_revealed: false, host_vote: null, current_ticket_id: nextTicket.id })
             .eq('id', roomId)
-
-        await supabase
-            .from('votes')
-            .delete()
-            .eq('room_id', roomId)
     }
 
     const handleReset = async () => {
         setIsRevealed(false)
         setMyVote(null)
         setVotes({})
+        setViewingTicketId(null)
 
         await supabase
             .from('rooms')
             .update({ is_revealed: false, host_vote: null })
             .eq('id', roomId)
 
-        await supabase
-            .from('votes')
-            .delete()
-            .eq('room_id', roomId)
+        // Delete votes for the current active ticket only (reset = start fresh on same ticket)
+        if (currentTicketId) {
+            await supabase
+                .from('votes')
+                .delete()
+                .eq('room_id', roomId)
+                .eq('ticket_id', currentTicketId)
+        }
+    }
+
+    // Navigate to a ticket (completed or active) in the sidebar
+    const handleViewTicket = async (ticketId) => {
+        if (ticketId === currentTicketId) {
+            // Snap back to the live active ticket
+            setViewingTicketId(null)
+            await fetchVotesForTicket(ticketId)
+            // Restore the room's current revealed state
+            const { data: room } = await supabase
+                .from('rooms')
+                .select('is_revealed')
+                .eq('id', roomId)
+                .single()
+            if (room) setIsRevealed(room.is_revealed)
+            return
+        }
+
+        // View a different (completed) ticket
+        setViewingTicketId(ticketId)
+        await fetchVotesForTicket(ticketId)
+
+        // Completed tickets are always "revealed"
+        const ticket = tickets.find(t => t.id === ticketId)
+        if (ticket?.status === 'completed') {
+            setIsRevealed(true)
+        }
     }
 
     const copyLink = () => {
@@ -354,7 +469,7 @@ export default function Room() {
     const allPlayers = hostEntry ? [hostEntry, ...participants] : participants
 
     // ── Get current ticket info ──
-    const currentTicket = tickets.find(t => t.id === currentTicketId)
+    const displayTicket = viewingTicket
     const completedCount = tickets.filter(t => t.status === 'completed').length
     const hasMoreTickets = tickets.some((t, i) => {
         const curIdx = tickets.findIndex(tk => tk.id === currentTicketId)
@@ -405,7 +520,7 @@ export default function Room() {
             {/* Main Content */}
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
                 {/* Participants Sidebar - Left */}
-                <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto">
+                <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto min-h-0">
                     <div className="flex items-center gap-2 text-slate-400 mb-3">
                         <Users className="w-4 h-4" />
                         <span className="text-xs font-medium uppercase tracking-wider">
@@ -454,15 +569,34 @@ export default function Room() {
 
                 {/* Center Area */}
                 <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
-                    {/* Current Ticket Banner */}
-                    {currentTicket && (
-                        <div className="w-full max-w-lg px-4 py-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20">
+                    {/* Back to active ticket button (when viewing a completed ticket) */}
+                    {!isViewingActiveTicket && (
+                        <button
+                            onClick={() => handleViewTicket(currentTicketId)}
+                            className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/10 border border-white/20 text-slate-300 hover:text-white hover:bg-white/20 transition-all text-sm"
+                        >
+                            <ArrowLeft className="w-4 h-4" />
+                            Back to active ticket
+                        </button>
+                    )}
+
+                    {/* Current/Viewed Ticket Banner */}
+                    {displayTicket && (
+                        <div className={`w-full max-w-lg px-4 py-3 rounded-xl ${isViewingActiveTicket
+                            ? 'bg-indigo-500/10 border border-indigo-500/20'
+                            : 'bg-amber-500/10 border border-amber-500/20'
+                            }`}>
                             <div className="flex items-center gap-2 mb-1">
                                 <Ticket className="w-4 h-4 text-indigo-400" />
-                                <span className="text-xs text-indigo-300 font-mono font-bold">{currentTicket.ticket_id}</span>
+                                <span className={`text-xs font-mono font-bold ${isViewingActiveTicket ? 'text-indigo-300' : 'text-amber-300'}`}>
+                                    {displayTicket.ticket_id}
+                                </span>
+                                {!isViewingActiveTicket && (
+                                    <span className="text-[10px] text-amber-400 uppercase tracking-wider ml-auto">Viewing history</span>
+                                )}
                             </div>
-                            {currentTicket.description && (
-                                <p className="text-sm text-slate-300 leading-relaxed">{currentTicket.description}</p>
+                            {displayTicket.description && (
+                                <p className="text-sm text-slate-300 leading-relaxed">{displayTicket.description}</p>
                             )}
                         </div>
                     )}
@@ -471,7 +605,7 @@ export default function Room() {
                     <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-white/5 border border-white/10">
                         <Clock className="w-4 h-4 text-slate-400" />
                         <span className="text-sm text-slate-300">
-                            {isRevealed
+                            {isRevealed || isViewingCompleted
                                 ? `Results: Average is ${average || '—'}`
                                 : `${voteValues.length} / ${allPlayers.length} voted`
                             }
@@ -484,9 +618,10 @@ export default function Room() {
                             const pIsHost = p.isHost === true
                             const hasVoted = votes[p.id] !== undefined
                             const voteValue = votes[p.id]
+                            const showVote = isRevealed || isViewingCompleted
                             return (
                                 <div key={p.id} className="flex flex-col items-center gap-2">
-                                    <div className={`w-14 h-20 sm:w-16 sm:h-24 rounded-xl flex items-center justify-center text-lg font-bold transition-all duration-500 ${isRevealed && hasVoted
+                                    <div className={`w-14 h-20 sm:w-16 sm:h-24 rounded-xl flex items-center justify-center text-lg font-bold transition-all duration-500 ${showVote && hasVoted
                                         ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/30 scale-105'
                                         : hasVoted
                                             ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-transparent shadow-lg shadow-emerald-500/20'
@@ -494,7 +629,7 @@ export default function Room() {
                                                 ? 'bg-amber-500/10 border-2 border-dashed border-amber-500/30 text-amber-400'
                                                 : 'bg-white/5 border-2 border-dashed border-white/20 text-transparent'
                                         }`}>
-                                        {isRevealed && hasVoted ? voteValue : hasVoted ? '✓' : pIsHost ? <Crown className="w-5 h-5" /> : '?'}
+                                        {showVote && hasVoted ? voteValue : hasVoted ? '✓' : pIsHost ? <Crown className="w-5 h-5" /> : '?'}
                                     </div>
                                     <span className="text-xs text-slate-400 max-w-[60px] truncate">
                                         {p.name}
@@ -505,8 +640,8 @@ export default function Room() {
                         })}
                     </div>
 
-                    {/* Host Controls */}
-                    {isHost && (
+                    {/* Host Controls — only show when viewing the active ticket */}
+                    {isHost && isViewingActiveTicket && (
                         <div className="flex gap-3">
                             {!isRevealed ? (
                                 <button
@@ -544,7 +679,7 @@ export default function Room() {
 
                 {/* Tickets Sidebar - Right */}
                 {tickets.length > 0 && (
-                    <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto">
+                    <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto min-h-0">
                         <div className="p-4">
                             <div className="flex items-center gap-2 text-slate-400 mb-3">
                                 <Hash className="w-4 h-4" />
@@ -556,14 +691,18 @@ export default function Room() {
                                 {tickets.map((ticket) => {
                                     const isActive = ticket.id === currentTicketId
                                     const isCompleted = ticket.status === 'completed'
+                                    const isViewing = ticket.id === activeViewTicketId
                                     return (
                                         <div
                                             key={ticket.id}
-                                            className={`p-3 rounded-xl transition-all ${isActive
-                                                ? 'bg-indigo-500/15 border border-indigo-500/30'
-                                                : isCompleted
-                                                    ? 'bg-emerald-500/5 border border-emerald-500/10'
-                                                    : 'bg-white/[0.03] border border-transparent hover:bg-white/5'
+                                            onClick={() => (isCompleted || isActive) ? handleViewTicket(ticket.id) : null}
+                                            className={`p-3 rounded-xl transition-all ${(isCompleted || isActive) ? 'cursor-pointer' : ''} ${isViewing
+                                                ? 'bg-indigo-500/15 border border-indigo-500/30 ring-1 ring-indigo-500/20'
+                                                : isActive
+                                                    ? 'bg-indigo-500/10 border border-indigo-500/20'
+                                                    : isCompleted
+                                                        ? 'bg-emerald-500/5 border border-emerald-500/10 hover:bg-emerald-500/10'
+                                                        : 'bg-white/[0.03] border border-transparent'
                                                 }`}
                                         >
                                             <div className="flex items-start gap-2.5">
@@ -578,7 +717,7 @@ export default function Room() {
                                                 </div>
                                                 <div className="min-w-0 flex-1">
                                                     <div className="flex items-center justify-between gap-2">
-                                                        <span className={`text-xs font-mono font-bold ${isActive ? 'text-indigo-300' : isCompleted ? 'text-emerald-300' : 'text-slate-400'}`}>
+                                                        <span className={`text-xs font-mono font-bold ${isViewing ? 'text-indigo-300' : isActive ? 'text-indigo-300' : isCompleted ? 'text-emerald-300' : 'text-slate-400'}`}>
                                                             {ticket.ticket_id}
                                                         </span>
                                                         {isCompleted && ticket.avg_score !== null && (
@@ -586,12 +725,15 @@ export default function Room() {
                                                                 {ticket.avg_score}
                                                             </span>
                                                         )}
-                                                        {isActive && (
+                                                        {isActive && !isViewing && (
                                                             <span className="text-[10px] text-indigo-400 uppercase tracking-wider font-medium">Active</span>
+                                                        )}
+                                                        {isViewing && (
+                                                            <span className="text-[10px] text-indigo-400 uppercase tracking-wider font-medium">Viewing</span>
                                                         )}
                                                     </div>
                                                     {ticket.description && (
-                                                        <p className={`text-xs mt-0.5 leading-relaxed ${isActive ? 'text-slate-300' : isCompleted ? 'text-slate-500' : 'text-slate-500'}`}>
+                                                        <p className={`text-xs mt-0.5 leading-relaxed ${isViewing ? 'text-slate-300' : isActive ? 'text-slate-300' : isCompleted ? 'text-slate-500' : 'text-slate-500'}`}>
                                                             {ticket.description}
                                                         </p>
                                                     )}
@@ -606,28 +748,33 @@ export default function Room() {
                 )}
             </div>
 
-            {/* Voting Hand - Fixed Bottom */}
-            {!isRevealed && (
-                <div className="shrink-0 border-t border-white/10 bg-slate-950/80 backdrop-blur-sm safe-area-pb">
-                    <div className="max-w-lg mx-auto py-4 px-4">
-                        <p className="text-xs text-slate-500 text-center mb-3 uppercase tracking-wider">Pick your estimate</p>
-                        <div className="flex justify-center gap-2 flex-wrap">
-                            {FIBONACCI.map((num) => (
-                                <button
-                                    key={num}
-                                    onClick={() => handleVote(num)}
-                                    className={`w-12 h-16 sm:w-14 sm:h-20 rounded-xl font-bold text-lg transition-all duration-200 ${myVote === num
-                                        ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/40 scale-110 -translate-y-1'
-                                        : 'bg-white/10 border border-white/20 text-slate-300 hover:bg-white/20 hover:border-indigo-500/50 hover:text-white hover:-translate-y-1'
-                                        }`}
-                                >
-                                    {num}
-                                </button>
-                            ))}
-                        </div>
+            {/* Voting Hand - Fixed Bottom (always visible so participants can update after reveal) */}
+            <div className="shrink-0 border-t border-white/10 bg-slate-950/80 backdrop-blur-sm safe-area-pb">
+                <div className="mx-auto py-4 px-4">
+                    <p className="text-xs text-slate-500 text-center mb-3 uppercase tracking-wider">
+                        {isViewingCompleted && !isViewingActiveTicket
+                            ? 'Update your estimate for this ticket'
+                            : isRevealed
+                                ? 'Change your estimate'
+                                : 'Pick your estimate'
+                        }
+                    </p>
+                    <div className="flex justify-center gap-2 flex-nowrap overflow-x-auto">
+                        {FIBONACCI.map((num) => (
+                            <button
+                                key={num}
+                                onClick={() => handleVote(num)}
+                                className={`w-12 h-16 sm:w-14 sm:h-20 rounded-xl font-bold text-lg transition-all duration-200 shrink-0 ${myVote === num
+                                    ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/40 scale-110 -translate-y-1'
+                                    : 'bg-white/10 border border-white/20 text-slate-300 hover:bg-white/20 hover:border-indigo-500/50 hover:text-white hover:-translate-y-1'
+                                    }`}
+                            >
+                                {num}
+                            </button>
+                        ))}
                     </div>
                 </div>
-            )}
+            </div>
         </div>
     )
 }

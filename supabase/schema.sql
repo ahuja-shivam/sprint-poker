@@ -59,9 +59,10 @@ create table public.votes (
   id uuid primary key default gen_random_uuid(),
   room_id uuid references public.rooms(id) on delete cascade,
   participant_id uuid references public.participants(id) on delete cascade,
+  ticket_id uuid references public.tickets(id) on delete cascade,
   value integer,
   created_at timestamptz default now(),
-  unique(room_id, participant_id)
+  unique(room_id, ticket_id, participant_id)
 );
 
 -- Enable RLS (required for Realtime)
