@@ -219,9 +219,12 @@ export default function Room() {
         // Call fetchState immediately (don't wait for subscription)
         fetchState()
 
+        // Use unique channel name to avoid Supabase channel name collision on re-mount
+        const channelName = `room-${roomId}-${Date.now()}`
+
         // Subscribe to changes
         const channel = supabase
-            .channel(`room-${roomId}`)
+            .channel(channelName)
             .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, (payload) => {
                 if (payload.new) {
                     const wasRevealed = payload.old?.is_revealed
@@ -267,12 +270,7 @@ export default function Room() {
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'votes', filter: `room_id=eq.${roomId}` }, (payload) => {
                 if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
-                    // Only update local votes if this vote belongs to the ticket we're viewing
-                    const voteTicketId = payload.new.ticket_id
                     setVotes((prev) => {
-                        // We need to check against activeViewTicketId, but since this is async
-                        // we use the ref-like approach: just always update, the ticket_id check
-                        // is done via the state being reset when switching tickets
                         return { ...prev, [payload.new.participant_id]: payload.new.value }
                     })
                 } else if (payload.eventType === 'DELETE') {
@@ -301,10 +299,10 @@ export default function Room() {
                 }
             })
 
-        // Poll every 3s as a fallback in case real-time events are missed
+        // Poll every 10s as a safety net (real-time should handle most updates)
         const pollInterval = setInterval(() => {
             fetchState()
-        }, 3000)
+        }, 10000)
 
         return () => {
             clearInterval(pollInterval)
