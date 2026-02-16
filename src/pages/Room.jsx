@@ -128,67 +128,96 @@ export default function Room() {
 
         let initialFetchDone = false
 
-        // Fetch initial state
+        // Fetch initial state — each query is wrapped in try-catch so
+        // a failure in one (e.g. host name lookup) doesn't block the rest
         const fetchState = async () => {
-            const { data: room } = await supabase
-                .from('rooms')
-                .select('is_revealed, host_id, host_vote, current_ticket_id')
-                .eq('id', roomId)
-                .single()
+            let room = null
+            try {
+                const { data } = await supabase
+                    .from('rooms')
+                    .select('is_revealed, host_id, host_vote, current_ticket_id')
+                    .eq('id', roomId)
+                    .single()
+                room = data
+            } catch (e) { console.warn('fetchState: rooms query failed', e) }
+
             if (room) {
                 setIsRevealed(room.is_revealed)
                 setCurrentTicketId(room.current_ticket_id)
-                // Fetch host name
-                if (room.host_id) {
-                    const { data: hostUser } = await supabase
-                        .from('app_users')
-                        .select('name')
-                        .eq('id', room.host_id)
-                        .single()
-                    if (hostUser) setHostName(hostUser.name)
-                }
+                // Fetch host name (best-effort — may fail due to RLS)
+                try {
+                    if (room.host_id) {
+                        const { data: hostUser } = await supabase
+                            .from('app_users')
+                            .select('name')
+                            .eq('id', room.host_id)
+                            .single()
+                        if (hostUser) setHostName(hostUser.name)
+                    }
+                } catch (e) { console.warn('fetchState: host name lookup failed', e) }
             }
 
-            const { data: parts } = await supabase
-                .from('participants')
-                .select('*')
-                .eq('room_id', roomId)
-            if (parts) setParticipants(parts)
+            try {
+                const { data: parts } = await supabase
+                    .from('participants')
+                    .select('*')
+                    .eq('room_id', roomId)
+                if (parts) setParticipants(parts)
+            } catch (e) { console.warn('fetchState: participants query failed', e) }
 
             // Fetch votes for active ticket
             const ticketToView = room?.current_ticket_id
             if (ticketToView) {
-                const { data: allVotes } = await supabase
-                    .from('votes')
-                    .select('*')
-                    .eq('room_id', roomId)
-                    .eq('ticket_id', ticketToView)
+                try {
+                    // Try fetching votes filtered by ticket_id
+                    let allVotes = null
+                    const { data: filtered } = await supabase
+                        .from('votes')
+                        .select('*')
+                        .eq('room_id', roomId)
+                        .eq('ticket_id', ticketToView)
+                    allVotes = filtered
 
-                const voteMap = {}
-                if (allVotes) {
-                    allVotes.forEach((v) => {
-                        voteMap[v.participant_id] = v.value
-                    })
-                    const mine = allVotes.find((v) => v.participant_id === myParticipantId)
-                    if (mine) setMyVote(mine.value)
-                }
-                // Add host vote
-                if (room?.host_vote !== null && room?.host_vote !== undefined) {
-                    voteMap.host = room.host_vote
-                }
-                setVotes(voteMap)
+                    // Fallback: if filtered returns null (column might not exist), fetch all
+                    if (!allVotes) {
+                        const { data: unfiltered } = await supabase
+                            .from('votes')
+                            .select('*')
+                            .eq('room_id', roomId)
+                        allVotes = unfiltered
+                    }
+
+                    const voteMap = {}
+                    if (allVotes) {
+                        allVotes.forEach((v) => {
+                            voteMap[v.participant_id] = v.value
+                        })
+                        const mine = allVotes.find((v) => v.participant_id === myParticipantId)
+                        if (mine) setMyVote(mine.value)
+                    }
+                    // Add host vote
+                    if (room?.host_vote !== null && room?.host_vote !== undefined) {
+                        voteMap.host = room.host_vote
+                    }
+                    setVotes(voteMap)
+                } catch (e) { console.warn('fetchState: votes query failed', e) }
             }
 
             // Fetch tickets
-            const { data: ticketData } = await supabase
-                .from('tickets')
-                .select('*')
-                .eq('room_id', roomId)
-                .order('position', { ascending: true })
-            if (ticketData) setTickets(ticketData)
+            try {
+                const { data: ticketData } = await supabase
+                    .from('tickets')
+                    .select('*')
+                    .eq('room_id', roomId)
+                    .order('position', { ascending: true })
+                if (ticketData) setTickets(ticketData)
+            } catch (e) { console.warn('fetchState: tickets query failed', e) }
 
             initialFetchDone = true
         }
+
+        // Call fetchState immediately (don't wait for subscription)
+        fetchState()
 
         // Subscribe to changes
         const channel = supabase
@@ -204,7 +233,10 @@ export default function Room() {
                     setCurrentTicketId(newTicketId)
 
                     // New round started (ticket changed or reveal → unrevealed): reset view to active ticket
-                    if ((wasRevealed && !nowRevealed) || (oldTicketId !== newTicketId)) {
+                    // Note: only compare ticket IDs when oldTicketId is defined, since
+                    // Supabase may omit unchanged fields from payload.old
+                    const ticketActuallyChanged = oldTicketId && oldTicketId !== newTicketId
+                    if ((wasRevealed && !nowRevealed) || ticketActuallyChanged) {
                         setViewingTicketId(null) // snap back to active ticket
                         setMyVote(null)
                         setVotes({})
@@ -269,7 +301,13 @@ export default function Room() {
                 }
             })
 
+        // Poll every 3s as a fallback in case real-time events are missed
+        const pollInterval = setInterval(() => {
+            fetchState()
+        }, 3000)
+
         return () => {
+            clearInterval(pollInterval)
             supabase.removeChannel(channel)
         }
     }, [roomId, hasJoined, myParticipantId])
@@ -297,6 +335,10 @@ export default function Room() {
             }
             return
         }
+
+        // Update local votes immediately so the card reflects the vote instantly
+        const updatedVotes = { ...votes, [myParticipantId]: value }
+        setVotes(updatedVotes)
 
         await supabase
             .from('votes')

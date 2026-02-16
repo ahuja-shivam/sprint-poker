@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../components/AuthContext'
 import { supabase } from '../lib/supabaseClient'
-import { Plus, Spade, ArrowRight, LogIn, LogOut, Shield, Trash2, Upload } from 'lucide-react'
+import { Plus, Spade, ArrowRight, LogIn, LogOut, Shield, Trash2, Upload, Clock } from 'lucide-react'
 
 export default function Home() {
     const { session, isAdmin, signOut } = useAuth()
@@ -132,6 +132,13 @@ export default function Home() {
                         {session ? (
                             <>
                                 <span className="text-sm text-slate-400 hidden sm:block">{session.user.name || session.user.email}</span>
+                                <button
+                                    onClick={() => navigate('/history')}
+                                    className="flex items-center gap-1.5 text-sm text-slate-400 hover:text-white transition-colors px-3 py-2 rounded-lg hover:bg-white/10"
+                                >
+                                    <Clock className="w-4 h-4" />
+                                    <span className="hidden sm:inline">History</span>
+                                </button>
                                 {isAdmin && (
                                     <button
                                         onClick={() => navigate('/admin')}
