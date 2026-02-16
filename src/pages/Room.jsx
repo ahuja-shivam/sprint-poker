@@ -719,7 +719,7 @@ export default function Room() {
 
                 {/* Tickets Sidebar - Right */}
                 {tickets.length > 0 && (
-                    <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto min-h-0">
+                    <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
                         <div className="p-4">
                             <div className="flex items-center gap-2 text-slate-400 mb-3">
                                 <Hash className="w-4 h-4" />
