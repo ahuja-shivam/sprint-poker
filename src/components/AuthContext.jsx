@@ -70,6 +70,17 @@ export function AuthProvider({ children }) {
         return { error: null, user: data }
     }
 
+    // Self-registration: create account + auto sign-in
+    const signUp = async (name, email, password) => {
+        const createResult = await createUser(name, email, password, 'normal')
+        if (createResult.error) {
+            return { error: createResult.error }
+        }
+        // Auto sign-in after successful registration
+        const signInResult = await signIn(email, password)
+        return signInResult
+    }
+
     // Delete a user (admin only)
     const deleteUser = async (userId) => {
         const { error } = await supabase
@@ -105,6 +116,7 @@ export function AuthProvider({ children }) {
                 loading,
                 isAdmin,
                 signIn,
+                signUp,
                 signOut,
                 createUser,
                 deleteUser,
