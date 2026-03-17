@@ -51,7 +51,9 @@ create table public.participants (
   id uuid primary key default gen_random_uuid(),
   room_id uuid references public.rooms(id) on delete cascade,
   name text not null,
-  created_at timestamptz default now()
+  email text not null default '',
+  created_at timestamptz default now(),
+  unique(room_id, email)
 );
 
 -- Create votes table

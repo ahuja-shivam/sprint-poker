@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../components/AuthContext'
-import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft } from 'lucide-react'
+import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft, Mail } from 'lucide-react'
 
 const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 
@@ -21,6 +21,7 @@ export default function Room() {
     const [myParticipantId, setMyParticipantId] = useState(null)
     const [copied, setCopied] = useState(false)
     const [guestName, setGuestName] = useState('')
+    const [guestEmail, setGuestEmail] = useState('')
     const [hasJoined, setHasJoined] = useState(false)
     const [hostName, setHostName] = useState('')
     const [tickets, setTickets] = useState([])
@@ -29,7 +30,7 @@ export default function Room() {
     const joinCalledRef = useRef(false)
 
     // Determine if we need a name prompt (guest flow)
-    const needsName = !isHost && !sessionStorage.getItem('poker_guest_name') && !hasJoined
+    const needsName = !isHost && (!sessionStorage.getItem('poker_guest_name') || !sessionStorage.getItem('poker_guest_email')) && !hasJoined
 
     // The ticket the user is currently viewing (defaults to active ticket)
     const activeViewTicketId = viewingTicketId || currentTicketId
@@ -89,9 +90,11 @@ export default function Room() {
         joinCalledRef.current = true
 
         const name = sessionStorage.getItem('poker_guest_name') || 'Guest'
+        const email = (sessionStorage.getItem('poker_guest_email') || '').toLowerCase()
         const participantKey = `poker_participant_${roomId}`
 
         const joinRoom = async () => {
+            // 1. Try to restore from sessionStorage (same-tab refresh)
             const existingId = sessionStorage.getItem(participantKey)
             if (existingId) {
                 const { data: existing } = await supabase
@@ -106,9 +109,33 @@ export default function Room() {
                 }
             }
 
+            // 2. Look up by email in this room (rejoin from another tab)
+            if (email) {
+                const { data: existingByEmail } = await supabase
+                    .from('participants')
+                    .select('id, name')
+                    .eq('room_id', roomId)
+                    .eq('email', email)
+                    .single()
+                if (existingByEmail) {
+                    // Update name if it changed
+                    if (existingByEmail.name !== name) {
+                        await supabase
+                            .from('participants')
+                            .update({ name })
+                            .eq('id', existingByEmail.id)
+                    }
+                    setMyParticipantId(existingByEmail.id)
+                    sessionStorage.setItem(participantKey, existingByEmail.id)
+                    setHasJoined(true)
+                    return
+                }
+            }
+
+            // 3. Create new participant
             const { data, error } = await supabase
                 .from('participants')
-                .insert([{ room_id: roomId, name }])
+                .insert([{ room_id: roomId, name, email }])
                 .select()
                 .single()
 
@@ -463,8 +490,9 @@ export default function Room() {
     // Handle guest name submission
     const handleGuestJoin = (e) => {
         e.preventDefault()
-        if (!guestName.trim()) return
+        if (!guestName.trim() || !guestEmail.trim()) return
         sessionStorage.setItem('poker_guest_name', guestName.trim())
+        sessionStorage.setItem('poker_guest_email', guestEmail.trim().toLowerCase())
         setHasJoined(false)
         window.location.reload()
     }
@@ -479,7 +507,7 @@ export default function Room() {
                             <Spade className="w-7 h-7 text-white" />
                         </div>
                         <h2 className="text-xl font-bold text-white">Join the Room</h2>
-                        <p className="text-slate-400 text-sm mt-1">Enter your name to join</p>
+                        <p className="text-slate-400 text-sm mt-1">Enter your details to join</p>
                     </div>
                     <form onSubmit={handleGuestJoin} className="space-y-4">
                         <input
@@ -491,9 +519,20 @@ export default function Room() {
                             autoFocus
                             className="w-full px-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all text-center text-lg"
                         />
+                        <div className="relative">
+                            <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500 pointer-events-none" />
+                            <input
+                                type="email"
+                                placeholder="Your email"
+                                value={guestEmail}
+                                onChange={(e) => setGuestEmail(e.target.value)}
+                                className="w-full pl-10 pr-4 py-3 rounded-xl bg-white/10 border border-white/20 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all"
+                            />
+                        </div>
+                        <p className="text-[11px] text-slate-500 -mt-2 px-1">Email is used to identify you if you rejoin</p>
                         <button
                             type="submit"
-                            disabled={!guestName.trim()}
+                            disabled={!guestName.trim() || !guestEmail.trim()}
                             className="w-full py-3 rounded-xl bg-gradient-to-r from-indigo-600 to-purple-600 text-white font-semibold hover:from-indigo-500 hover:to-purple-500 disabled:opacity-40 disabled:cursor-not-allowed transition-all shadow-lg shadow-indigo-500/25"
                         >
                             Join Room
