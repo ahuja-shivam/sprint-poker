@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../components/AuthContext'
-import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft, Mail } from 'lucide-react'
+import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft, Mail, X, Loader2, Lock, Unlock } from 'lucide-react'
 
 const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 
@@ -28,15 +28,19 @@ export default function Room() {
     const [currentTicketId, setCurrentTicketId] = useState(null)
     const [viewingTicketId, setViewingTicketId] = useState(null)
     const joinCalledRef = useRef(false)
+    const [removingId, setRemovingId] = useState(null)
 
     // Determine if we need a name prompt (guest flow)
     const needsName = !isHost && (!sessionStorage.getItem('poker_guest_name') || !sessionStorage.getItem('poker_guest_email')) && !hasJoined
 
     // The ticket the user is currently viewing (defaults to active ticket)
     const activeViewTicketId = viewingTicketId || currentTicketId
+    const activeViewTicketIdRef = useRef(activeViewTicketId)
+    activeViewTicketIdRef.current = activeViewTicketId
     const isViewingActiveTicket = activeViewTicketId === currentTicketId
     const viewingTicket = tickets.find(t => t.id === activeViewTicketId)
     const isViewingCompleted = viewingTicket?.status === 'completed'
+    const isTicketLocked = viewingTicket?.is_locked === true
 
     // Helper: fetch votes for a specific ticket and update state
     const fetchVotesForTicket = async (ticketId) => {
@@ -57,8 +61,22 @@ export default function Room() {
             setMyVote(null)
         }
 
-        // Fetch host vote from room (host_vote is per-active-ticket only)
-        if (isViewingActiveTicket || ticketId === currentTicketId) {
+        // 1. Fetch persistent host vote from the tickets table (for completed or previously voted tickets)
+        const { data: ticketData } = await supabase
+            .from('tickets')
+            .select('host_vote')
+            .eq('id', ticketId)
+            .single()
+
+        let foundHostVote = false
+        if (ticketData?.host_vote !== null && ticketData?.host_vote !== undefined) {
+            voteMap.host = ticketData.host_vote
+            if (isHost) setMyVote(ticketData.host_vote)
+            foundHostVote = true
+        }
+
+        // 2. If no persistent host vote, and we are viewing the active ticket, check the rooms table
+        if (!foundHostVote && (isViewingActiveTicket || ticketId === currentTicketId)) {
             const { data: room } = await supabase
                 .from('rooms')
                 .select('host_vote')
@@ -66,7 +84,14 @@ export default function Room() {
                 .single()
             if (room?.host_vote !== null && room?.host_vote !== undefined) {
                 voteMap.host = room.host_vote
+                if (isHost) setMyVote(room.host_vote)
+                foundHostVote = true
             }
+        }
+
+        // 3. Clear host vote if we didn't find one and we are host (and 'mine' isn't set)
+        if (isHost && !foundHostVote && !voteMap[myParticipantId]) {
+            setMyVote(null)
         }
 
         setVotes(voteMap)
@@ -296,8 +321,12 @@ export default function Room() {
                 }
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'votes', filter: `room_id=eq.${roomId}` }, (payload) => {
+                // Only process votes for the currently viewed ticket
+                const voteTicketId = payload.new?.ticket_id || payload.old?.ticket_id
                 if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
                     setVotes((prev) => {
+                        // Ignore votes for a different ticket than what we're viewing
+                        if (voteTicketId && voteTicketId !== activeViewTicketIdRef.current) return prev
                         return { ...prev, [payload.new.participant_id]: payload.new.value }
                     })
                 } else if (payload.eventType === 'DELETE') {
@@ -390,17 +419,30 @@ export default function Room() {
             .update({ is_revealed: true })
             .eq('id', roomId)
 
-        // Calculate average and save to current ticket
+        // Calculate average and save to current ticket (including host vote)
         if (currentTicketId) {
             const voteVals = Object.values(votes).filter(v => v !== null && v !== undefined)
+            const ticketUpdate = { status: 'completed' }
             if (voteVals.length > 0) {
-                const avg = parseFloat((voteVals.reduce((a, b) => a + b, 0) / voteVals.length).toFixed(1))
-                await supabase
-                    .from('tickets')
-                    .update({ avg_score: avg, status: 'completed' })
-                    .eq('id', currentTicketId)
+                ticketUpdate.avg_score = parseFloat((voteVals.reduce((a, b) => a + b, 0) / voteVals.length).toFixed(1))
             }
+            // Persist host vote to the ticket for history
+            if (votes.host !== undefined && votes.host !== null) {
+                ticketUpdate.host_vote = votes.host
+            }
+            await supabase
+                .from('tickets')
+                .update(ticketUpdate)
+                .eq('id', currentTicketId)
         }
+    }
+
+    const handleToggleLock = async () => {
+        if (!activeViewTicketId) return
+        await supabase
+            .from('tickets')
+            .update({ is_locked: !isTicketLocked })
+            .eq('id', activeViewTicketId)
     }
 
     const handleNextTicket = async () => {
@@ -453,7 +495,7 @@ export default function Room() {
         }
     }
 
-    // Navigate to a ticket (completed or active) in the sidebar
+    // Navigate to a ticket in the sidebar
     const handleViewTicket = async (ticketId) => {
         if (ticketId === currentTicketId) {
             // Snap back to the live active ticket
@@ -469,14 +511,49 @@ export default function Room() {
             return
         }
 
-        // View a different (completed) ticket
+        // View a different ticket
         setViewingTicketId(ticketId)
-        await fetchVotesForTicket(ticketId)
 
-        // Completed tickets are always "revealed"
         const ticket = tickets.find(t => t.id === ticketId)
         if (ticket?.status === 'completed') {
+            // Completed tickets - show all votes (always revealed)
+            await fetchVotesForTicket(ticketId)
             setIsRevealed(true)
+        } else {
+            // Pending/active ticket that isn't the current one
+            // Only load the viewer's own vote — hide everyone else's
+            const voteMap = {}
+            if (myParticipantId) {
+                const { data: myVoteData } = await supabase
+                    .from('votes')
+                    .select('value')
+                    .eq('room_id', roomId)
+                    .eq('ticket_id', ticketId)
+                    .eq('participant_id', myParticipantId)
+                    .single()
+                if (myVoteData) {
+                    voteMap[myParticipantId] = myVoteData.value
+                    setMyVote(myVoteData.value)
+                } else {
+                    setMyVote(null)
+                }
+            }
+            // Host viewing a non-current pending ticket — load host vote from ticket table
+            if (isHost) {
+                const { data: ticketData } = await supabase
+                    .from('tickets')
+                    .select('host_vote')
+                    .eq('id', ticketId)
+                    .single()
+                if (ticketData?.host_vote !== null && ticketData?.host_vote !== undefined) {
+                    voteMap.host = ticketData.host_vote
+                    setMyVote(ticketData.host_vote)
+                } else {
+                    setMyVote(null)
+                }
+            }
+            setVotes(voteMap)
+            setIsRevealed(false)
         }
     }
 
@@ -485,6 +562,24 @@ export default function Room() {
         navigator.clipboard.writeText(joinUrl)
         setCopied(true)
         setTimeout(() => setCopied(false), 2000)
+    }
+
+    // Remove a participant (host only)
+    const handleRemoveParticipant = async (participantId) => {
+        setRemovingId(participantId)
+        try {
+            // Delete votes first (foreign key), then participant
+            await supabase
+                .from('votes')
+                .delete()
+                .eq('participant_id', participantId)
+            await supabase
+                .from('participants')
+                .delete()
+                .eq('id', participantId)
+        } finally {
+            setRemovingId(null)
+        }
     }
 
     // Handle guest name submission
@@ -608,12 +703,15 @@ export default function Room() {
                     </div>
                     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-1 gap-2">
                         {allPlayers.map((p) => {
+                            const isMe = p.id === myParticipantId || (isHost && p.isHost)
                             const hasVoted = votes[p.id] !== undefined
+                            // Only show others' vote status if revealed, completed, or on the active ticket
+                            const showVoteIndicator = isMe || isRevealed || isViewingCompleted || isViewingActiveTicket
                             const pIsHost = p.isHost === true
                             return (
                                 <div
                                     key={p.id}
-                                    className={`flex items-center gap-3 p-2.5 rounded-xl transition-all ${pIsHost
+                                    className={`group flex items-center gap-3 p-2.5 rounded-xl transition-all ${pIsHost
                                         ? 'bg-amber-500/10 border border-amber-500/20'
                                         : p.id === myParticipantId
                                             ? 'bg-indigo-500/10 border border-indigo-500/30'
@@ -624,22 +722,35 @@ export default function Room() {
                                         ? 'bg-amber-500/20 text-amber-400'
                                         : isRevealed && hasVoted
                                             ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white'
-                                            : hasVoted
+                                            : showVoteIndicator && hasVoted
                                                 ? 'bg-emerald-500/20 text-emerald-400'
                                                 : 'bg-white/10 text-slate-500'
                                         }`}>
-                                        {pIsHost ? <Crown className="w-4 h-4" /> : isRevealed && hasVoted ? votes[p.id] : hasVoted ? '✓' : '?'}
+                                        {pIsHost ? <Crown className="w-4 h-4" /> : isRevealed && hasVoted ? votes[p.id] : showVoteIndicator && hasVoted ? '✓' : '?'}
                                     </div>
-                                    <div className="min-w-0">
+                                    <div className="min-w-0 flex-1">
                                         <p className="text-sm text-white font-medium truncate">
                                             {p.name}
                                             {pIsHost && <span className="text-amber-400 ml-1">· Host</span>}
                                             {!pIsHost && p.id === myParticipantId && <span className="text-indigo-400 ml-1">(You)</span>}
                                         </p>
                                         <p className="text-[10px] text-slate-500">
-                                            {pIsHost ? 'Facilitator' : isRevealed ? (hasVoted ? `Voted ${votes[p.id]}` : 'No vote') : (hasVoted ? 'Voted' : 'Thinking...')}
+                                            {pIsHost ? 'Facilitator' : isRevealed ? (hasVoted ? `Voted ${votes[p.id]}` : 'No vote') : showVoteIndicator ? (hasVoted ? 'Voted' : 'Thinking...') : ''}
                                         </p>
                                     </div>
+                                    {isHost && !pIsHost && (
+                                        <button
+                                            onClick={(e) => { e.stopPropagation(); handleRemoveParticipant(p.id) }}
+                                            disabled={removingId === p.id}
+                                            title="Remove participant"
+                                            className="shrink-0 w-6 h-6 rounded-md flex items-center justify-center text-slate-600 hover:text-red-400 hover:bg-red-500/10 transition-all opacity-0 group-hover:opacity-100 disabled:opacity-100"
+                                        >
+                                            {removingId === p.id
+                                                ? <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />
+                                                : <X className="w-3.5 h-3.5" />
+                                            }
+                                        </button>
+                                    )}
                                 </div>
                             )
                         })}
@@ -695,20 +806,23 @@ export default function Room() {
                     <div className="flex flex-wrap justify-center gap-3 max-w-lg">
                         {allPlayers.map((p) => {
                             const pIsHost = p.isHost === true
+                            const isMe = p.id === myParticipantId || (isHost && pIsHost)
                             const hasVoted = votes[p.id] !== undefined
                             const voteValue = votes[p.id]
                             const showVote = isRevealed || isViewingCompleted
+                            // Before reveal, only show own card state (or on the active ticket)
+                            const showCardState = isMe || showVote || isViewingActiveTicket
                             return (
                                 <div key={p.id} className="flex flex-col items-center gap-2">
                                     <div className={`w-14 h-20 sm:w-16 sm:h-24 rounded-xl flex items-center justify-center text-lg font-bold transition-all duration-500 ${showVote && hasVoted
                                         ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/30 scale-105'
-                                        : hasVoted
+                                        : showCardState && hasVoted
                                             ? 'bg-gradient-to-br from-emerald-600 to-teal-700 text-transparent shadow-lg shadow-emerald-500/20'
                                             : pIsHost
                                                 ? 'bg-amber-500/10 border-2 border-dashed border-amber-500/30 text-amber-400'
                                                 : 'bg-white/5 border-2 border-dashed border-white/20 text-transparent'
                                         }`}>
-                                        {showVote && hasVoted ? voteValue : hasVoted ? '✓' : pIsHost ? <Crown className="w-5 h-5" /> : '?'}
+                                        {showVote && hasVoted ? voteValue : showCardState && hasVoted ? '✓' : pIsHost ? <Crown className="w-5 h-5" /> : '?'}
                                     </div>
                                     <span className="text-xs text-slate-400 max-w-[60px] truncate">
                                         {p.name}
@@ -733,6 +847,16 @@ export default function Room() {
                                 </button>
                             ) : (
                                 <>
+                                    <button
+                                        onClick={handleToggleLock}
+                                        className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-all ${isTicketLocked
+                                            ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-300'
+                                            : 'bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+                                        }`}
+                                    >
+                                        {isTicketLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+                                        {isTicketLocked ? 'Unlock Scores' : 'Lock Scores'}
+                                    </button>
                                     {hasMoreTickets ? (
                                         <button
                                             onClick={handleNextTicket}
@@ -754,6 +878,20 @@ export default function Room() {
                             )}
                         </div>
                     )}
+
+                    {/* Lock/Unlock for non-active tickets (completed or pending) */}
+                    {isHost && !isViewingActiveTicket && (
+                        <button
+                            onClick={handleToggleLock}
+                            className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-all ${isTicketLocked
+                                ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-300'
+                                : 'bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
+                            }`}
+                        >
+                            {isTicketLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+                            {isTicketLocked ? 'Unlock Scores' : 'Lock Scores'}
+                        </button>
+                    )}
                 </div>
 
                 {/* Tickets Sidebar - Right */}
@@ -774,14 +912,14 @@ export default function Room() {
                                     return (
                                         <div
                                             key={ticket.id}
-                                            onClick={() => (isCompleted || isActive) ? handleViewTicket(ticket.id) : null}
-                                            className={`p-3 rounded-xl transition-all ${(isCompleted || isActive) ? 'cursor-pointer' : ''} ${isViewing
+                                            onClick={() => handleViewTicket(ticket.id)}
+                                            className={`p-3 rounded-xl transition-all cursor-pointer ${isViewing
                                                 ? 'bg-indigo-500/15 border border-indigo-500/30 ring-1 ring-indigo-500/20'
                                                 : isActive
-                                                    ? 'bg-indigo-500/10 border border-indigo-500/20'
+                                                    ? 'bg-indigo-500/10 border border-indigo-500/20 hover:bg-indigo-500/15'
                                                     : isCompleted
                                                         ? 'bg-emerald-500/5 border border-emerald-500/10 hover:bg-emerald-500/10'
-                                                        : 'bg-white/[0.03] border border-transparent'
+                                                        : 'bg-white/[0.03] border border-transparent hover:bg-white/[0.06]'
                                                 }`}
                                         >
                                             <div className="flex items-start gap-2.5">
@@ -827,15 +965,17 @@ export default function Room() {
                 )}
             </div>
 
-            {/* Voting Hand - Fixed Bottom (always visible so participants can update after reveal) */}
+            {/* Voting Hand - Fixed Bottom */}
             <div className="shrink-0 border-t border-white/10 bg-slate-950/80 backdrop-blur-sm safe-area-pb">
                 <div className="mx-auto py-4 px-4">
                     <p className="text-xs text-slate-500 text-center mb-3 uppercase tracking-wider">
-                        {isViewingCompleted && !isViewingActiveTicket
-                            ? 'Update your estimate for this ticket'
-                            : isRevealed
-                                ? 'Change your estimate'
-                                : 'Pick your estimate'
+                        {isTicketLocked
+                            ? 'Scores are locked for this ticket'
+                            : isViewingCompleted && !isViewingActiveTicket
+                                ? 'Update your estimate for this ticket'
+                                : isRevealed
+                                    ? 'Change your estimate'
+                                    : 'Pick your estimate'
                         }
                     </p>
                     <div className="flex justify-center gap-2 flex-nowrap overflow-x-auto">
@@ -843,9 +983,12 @@ export default function Room() {
                             <button
                                 key={num}
                                 onClick={() => handleVote(num)}
-                                className={`w-12 h-16 sm:w-14 sm:h-20 rounded-xl font-bold text-lg transition-all duration-200 shrink-0 ${myVote === num
-                                    ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/40 scale-110 -translate-y-1'
-                                    : 'bg-white/10 border border-white/20 text-slate-300 hover:bg-white/20 hover:border-indigo-500/50 hover:text-white hover:-translate-y-1'
+                                disabled={isTicketLocked}
+                                className={`w-12 h-16 sm:w-14 sm:h-20 rounded-xl font-bold text-lg transition-all duration-200 shrink-0 ${isTicketLocked
+                                    ? 'bg-white/5 border border-white/10 text-slate-600 cursor-not-allowed'
+                                    : myVote === num
+                                        ? 'bg-gradient-to-br from-indigo-500 to-purple-600 text-white shadow-lg shadow-indigo-500/40 scale-110 -translate-y-1'
+                                        : 'bg-white/10 border border-white/20 text-slate-300 hover:bg-white/20 hover:border-indigo-500/50 hover:text-white hover:-translate-y-1'
                                     }`}
                             >
                                 {num}

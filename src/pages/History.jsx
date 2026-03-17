@@ -327,8 +327,15 @@ export default function History() {
                                                                     )}
 
                                                                     {/* Vote breakdown */}
-                                                                    {ticketVotes.length > 0 && (
+                                                                    {(ticketVotes.length > 0 || ticket.host_vote !== null) && (
                                                                         <div className="flex flex-wrap gap-1.5 mt-2 pt-2 border-t border-white/5">
+                                                                            {ticket.host_vote !== null && ticket.host_vote !== undefined && (
+                                                                                <span className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-amber-500/10 border border-amber-500/20 text-xs">
+                                                                                    <Crown className="w-3 h-3 text-amber-400" />
+                                                                                    <span className="text-amber-300">{roomDetail.hostName}</span>
+                                                                                    <span className="font-bold text-amber-300">{ticket.host_vote}</span>
+                                                                                </span>
+                                                                            )}
                                                                             {ticketVotes.map(vote => {
                                                                                 const participant = roomDetail.participants.find(p => p.id === vote.participant_id)
                                                                                 return (

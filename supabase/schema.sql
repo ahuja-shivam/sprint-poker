@@ -42,6 +42,8 @@ create table public.tickets (
   description text,
   position integer not null default 0,
   avg_score real,
+  host_vote integer,
+  is_locked boolean default false,
   status text not null default 'pending' check (status in ('pending', 'active', 'completed')),
   created_at timestamptz default now()
 );
