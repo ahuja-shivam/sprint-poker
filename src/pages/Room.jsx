@@ -28,6 +28,10 @@ export default function Room() {
     const [currentTicketId, setCurrentTicketId] = useState(null)
     const [viewingTicketId, setViewingTicketId] = useState(null)
     const joinCalledRef = useRef(false)
+    // Keep a ref to the latest currentTicketId so realtime handlers can
+    // detect ticket changes even when payload.old is missing fields
+    // (Supabase DEFAULT replica identity omits unchanged columns in .old)
+    const currentTicketIdRef = useRef(null)
     const [removingId, setRemovingId] = useState(null)
     const [isAddingTicket, setIsAddingTicket] = useState(false)
     const [newTicketId, setNewTicketId] = useState('')
@@ -43,6 +47,8 @@ export default function Room() {
     activeViewTicketIdRef.current = activeViewTicketId
     const viewingTicketIdRef = useRef(viewingTicketId)
     viewingTicketIdRef.current = viewingTicketId
+    // Keep currentTicketIdRef in sync every render
+    currentTicketIdRef.current = currentTicketId
     const isViewingActiveTicket = activeViewTicketId === currentTicketId
     const viewingTicket = tickets.find(t => t.id === activeViewTicketId)
     const isViewingCompleted = viewingTicket?.status === 'completed'
@@ -267,21 +273,23 @@ export default function Room() {
                     const nowRevealed = payload.new.is_revealed
                     setIsRevealed(nowRevealed)
 
-                    const oldTicketId = payload.old?.current_ticket_id
                     const newTicketId = payload.new.current_ticket_id
+                    // Use our ref to get the PREVIOUS ticket id — more reliable than
+                    // payload.old which may omit unchanged cols (DEFAULT replica identity)
+                    const prevTicketId = currentTicketIdRef.current
                     setCurrentTicketId(newTicketId)
 
-                    // New round started (ticket changed or reveal → unrevealed): reset view to active ticket
-                    // Note: only compare ticket IDs when oldTicketId is defined, since
-                    // Supabase may omit unchanged fields from payload.old
-                    const ticketActuallyChanged = oldTicketId && oldTicketId !== newTicketId
+                    // New round: ticket changed or reveal flipped back to unrevealed
+                    const ticketActuallyChanged = newTicketId !== prevTicketId
                     if ((wasRevealed && !nowRevealed) || ticketActuallyChanged) {
                         setViewingTicketId(null) // snap back to active ticket
                         setMyVote(null)
                         setVotes({})
 
                         if (ticketActuallyChanged && newTicketId) {
-                            // Immediately fetch pre-existing votes for the new ticket
+                            // Fetch ALL pre-existing participant votes for the new ticket
+                            // (covers the case where someone pre-voted before this ticket
+                            // became active)
                             supabase
                                 .from('votes')
                                 .select('*')
