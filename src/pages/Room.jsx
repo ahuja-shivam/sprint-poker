@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../components/AuthContext'
-import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft, Mail, X, Loader2, Lock, Unlock } from 'lucide-react'
+import { Copy, Eye, RotateCcw, Check, Clock, Users, Spade, Crown, ChevronRight, Ticket, Hash, CheckCircle2, Circle, Play, ArrowLeft, Mail, X, Loader2, Lock, Unlock, Plus } from 'lucide-react'
 
 const FIBONACCI = [0, 1, 2, 3, 5, 8, 13, 21]
 
@@ -29,6 +29,10 @@ export default function Room() {
     const [viewingTicketId, setViewingTicketId] = useState(null)
     const joinCalledRef = useRef(false)
     const [removingId, setRemovingId] = useState(null)
+    const [isAddingTicket, setIsAddingTicket] = useState(false)
+    const [newTicketId, setNewTicketId] = useState('')
+    const [newTicketDesc, setNewTicketDesc] = useState('')
+    const [isSubmittingTicket, setIsSubmittingTicket] = useState(false)
 
     // Determine if we need a name prompt (guest flow)
     const needsName = !isHost && (!sessionStorage.getItem('poker_guest_name') || !sessionStorage.getItem('poker_guest_email')) && !hasJoined
@@ -37,6 +41,8 @@ export default function Room() {
     const activeViewTicketId = viewingTicketId || currentTicketId
     const activeViewTicketIdRef = useRef(activeViewTicketId)
     activeViewTicketIdRef.current = activeViewTicketId
+    const viewingTicketIdRef = useRef(viewingTicketId)
+    viewingTicketIdRef.current = viewingTicketId
     const isViewingActiveTicket = activeViewTicketId === currentTicketId
     const viewingTicket = tickets.find(t => t.id === activeViewTicketId)
     const isViewingCompleted = viewingTicket?.status === 'completed'
@@ -158,7 +164,7 @@ export default function Room() {
             }
 
             // 3. Create new participant
-            const { data, error } = await supabase
+            const { data } = await supabase
                 .from('participants')
                 .insert([{ room_id: roomId, name, email }])
                 .select()
@@ -179,65 +185,52 @@ export default function Room() {
         if (!hasJoined) return
 
         let initialFetchDone = false
+        let realtimeHealthy = false
+        let fetchInProgress = false
 
         // Fetch initial state — each query is wrapped in try-catch so
         // a failure in one (e.g. host name lookup) doesn't block the rest
         const fetchState = async () => {
-            let room = null
-            try {
-                const { data } = await supabase
-                    .from('rooms')
-                    .select('is_revealed, host_id, host_vote, current_ticket_id')
-                    .eq('id', roomId)
-                    .single()
-                room = data
-            } catch (e) { console.warn('fetchState: rooms query failed', e) }
+            // Prevent concurrent fetches from racing against each other
+            if (fetchInProgress) return
+            fetchInProgress = true
+            try { await _fetchStateInner() } finally { fetchInProgress = false }
+        }
+        const _fetchStateInner = async () => {
+            // Fire all independent queries in parallel
+            const [roomResult, partsResult, ticketResult] = await Promise.allSettled([
+                supabase.from('rooms').select('is_revealed, host_id, host_vote, current_ticket_id').eq('id', roomId).single(),
+                supabase.from('participants').select('*').eq('room_id', roomId),
+                supabase.from('tickets').select('*').eq('room_id', roomId).order('position', { ascending: true }),
+            ])
+
+            const room = roomResult.status === 'fulfilled' ? roomResult.value.data : null
+            const parts = partsResult.status === 'fulfilled' ? partsResult.value.data : null
+            const ticketData = ticketResult.status === 'fulfilled' ? ticketResult.value.data : null
 
             if (room) {
                 setIsRevealed(room.is_revealed)
                 setCurrentTicketId(room.current_ticket_id)
                 // Fetch host name (best-effort — may fail due to RLS)
-                try {
-                    if (room.host_id) {
-                        const { data: hostUser } = await supabase
-                            .from('app_users')
-                            .select('name')
-                            .eq('id', room.host_id)
-                            .single()
-                        if (hostUser) setHostName(hostUser.name)
-                    }
-                } catch (e) { console.warn('fetchState: host name lookup failed', e) }
+                if (room.host_id) {
+                    supabase.from('app_users').select('name').eq('id', room.host_id).single()
+                        .then(({ data: hostUser }) => { if (hostUser) setHostName(hostUser.name) })
+                        .catch(() => {})
+                }
             }
 
-            try {
-                const { data: parts } = await supabase
-                    .from('participants')
-                    .select('*')
-                    .eq('room_id', roomId)
-                if (parts) setParticipants(parts)
-            } catch (e) { console.warn('fetchState: participants query failed', e) }
+            if (parts) setParticipants(parts)
+            if (ticketData) setTickets(ticketData)
 
             // Fetch votes for active ticket
             const ticketToView = room?.current_ticket_id
             if (ticketToView) {
                 try {
-                    // Try fetching votes filtered by ticket_id
-                    let allVotes = null
-                    const { data: filtered } = await supabase
+                    const { data: allVotes } = await supabase
                         .from('votes')
                         .select('*')
                         .eq('room_id', roomId)
                         .eq('ticket_id', ticketToView)
-                    allVotes = filtered
-
-                    // Fallback: if filtered returns null (column might not exist), fetch all
-                    if (!allVotes) {
-                        const { data: unfiltered } = await supabase
-                            .from('votes')
-                            .select('*')
-                            .eq('room_id', roomId)
-                        allVotes = unfiltered
-                    }
 
                     const voteMap = {}
                     if (allVotes) {
@@ -255,16 +248,6 @@ export default function Room() {
                 } catch (e) { console.warn('fetchState: votes query failed', e) }
             }
 
-            // Fetch tickets
-            try {
-                const { data: ticketData } = await supabase
-                    .from('tickets')
-                    .select('*')
-                    .eq('room_id', roomId)
-                    .order('position', { ascending: true })
-                if (ticketData) setTickets(ticketData)
-            } catch (e) { console.warn('fetchState: tickets query failed', e) }
-
             initialFetchDone = true
         }
 
@@ -278,6 +261,7 @@ export default function Room() {
         const channel = supabase
             .channel(channelName)
             .on('postgres_changes', { event: '*', schema: 'public', table: 'rooms', filter: `id=eq.${roomId}` }, (payload) => {
+                realtimeHealthy = true
                 if (payload.new) {
                     const wasRevealed = payload.old?.is_revealed
                     const nowRevealed = payload.new.is_revealed
@@ -295,32 +279,80 @@ export default function Room() {
                         setViewingTicketId(null) // snap back to active ticket
                         setMyVote(null)
                         setVotes({})
+                        
+                        if (ticketActuallyChanged && newTicketId) {
+                            // Immediately fetch pre-existing votes for the new ticket
+                            supabase
+                                .from('votes')
+                                .select('*')
+                                .eq('room_id', roomId)
+                                .eq('ticket_id', newTicketId)
+                                .then(({ data: allVotes }) => {
+                                    if (allVotes) {
+                                        setVotes(prev => {
+                                            const copy = { ...prev }
+                                            allVotes.forEach(v => {
+                                                copy[v.participant_id] = v.value
+                                            })
+                                            return copy
+                                        })
+                                        
+                                        const mine = allVotes.find(v => v.participant_id === myParticipantId)
+                                        if (mine) setMyVote(mine.value)
+                                    }
+                                })
+                            
+                            // Also fetch persistent host vote if any
+                            supabase
+                                .from('tickets')
+                                .select('host_vote')
+                                .eq('id', newTicketId)
+                                .single()
+                                .then(({ data: ticketData }) => {
+                                    if (ticketData?.host_vote !== null && ticketData?.host_vote !== undefined) {
+                                        setVotes(prev => ({ ...prev, host: ticketData.host_vote }))
+                                        if (isHost) setMyVote(ticketData.host_vote)
+                                    }
+                                })
+                        }
                     }
 
-                    // Sync host vote from DB
-                    if (payload.new.host_vote !== null && payload.new.host_vote !== undefined) {
-                        setVotes((prev) => ({ ...prev, host: payload.new.host_vote }))
-                    } else {
-                        setVotes((prev) => {
-                            const copy = { ...prev }
-                            delete copy.host
-                            return copy
-                        })
+                    // Sync host vote from DB — only when viewing the active ticket.
+                    // If the user is browsing a different ticket via the sidebar
+                    // (viewingTicketIdRef.current !== null) we must NOT clobber that
+                    // ticket's vote display with the active ticket's host_vote.
+                    const isBrowsingHistory = viewingTicketIdRef.current !== null
+
+                    if (!isBrowsingHistory) {
+                        if (payload.new.host_vote !== null && payload.new.host_vote !== undefined) {
+                            setVotes((prev) => ({ ...prev, host: payload.new.host_vote }))
+                            if (isHost) setMyVote(payload.new.host_vote)
+                        } else {
+                            setVotes((prev) => {
+                                const copy = { ...prev }
+                                delete copy.host
+                                return copy
+                            })
+                        }
                     }
                 }
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'participants', filter: `room_id=eq.${roomId}` }, (payload) => {
                 if (!initialFetchDone) return
+                realtimeHealthy = true
                 if (payload.eventType === 'INSERT') {
                     setParticipants((prev) => {
                         if (prev.some((p) => p.id === payload.new.id)) return prev
                         return [...prev, payload.new]
                     })
+                } else if (payload.eventType === 'UPDATE') {
+                    setParticipants((prev) => prev.map((p) => p.id === payload.new.id ? payload.new : p))
                 } else if (payload.eventType === 'DELETE') {
                     setParticipants((prev) => prev.filter((p) => p.id !== payload.old.id))
                 }
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'votes', filter: `room_id=eq.${roomId}` }, (payload) => {
+                realtimeHealthy = true
                 // Only process votes for the currently viewed ticket
                 const voteTicketId = payload.new?.ticket_id || payload.old?.ticket_id
                 if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
@@ -338,6 +370,7 @@ export default function Room() {
                 }
             })
             .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets', filter: `room_id=eq.${roomId}` }, (payload) => {
+                realtimeHealthy = true
                 if (payload.eventType === 'INSERT') {
                     setTickets((prev) => {
                         if (prev.some(t => t.id === payload.new.id)) return prev
@@ -351,14 +384,22 @@ export default function Room() {
             })
             .subscribe((status) => {
                 if (status === 'SUBSCRIBED') {
+                    realtimeHealthy = true
                     fetchState()
+                }
+                if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+                    realtimeHealthy = false
                 }
             })
 
-        // Poll every 10s as a safety net (real-time should handle most updates)
+        // Poll every 30s as a safety net — skip if real-time is delivering events
         const pollInterval = setInterval(() => {
-            fetchState()
-        }, 10000)
+            if (!realtimeHealthy) {
+                fetchState()
+            }
+            // Reset flag so next interval checks again
+            realtimeHealthy = false
+        }, 30000)
 
         return () => {
             clearInterval(pollInterval)
@@ -374,10 +415,18 @@ export default function Room() {
         if (isHost) {
             const updatedVotes = { ...votes, host: value }
             setVotes(updatedVotes)
-            await supabase
-                .from('rooms')
-                .update({ host_vote: value })
-                .eq('id', roomId)
+            
+            if (targetTicketId === currentTicketId || !targetTicketId) {
+                await supabase
+                    .from('rooms')
+                    .update({ host_vote: value })
+                    .eq('id', roomId)
+            } else {
+                await supabase
+                    .from('tickets')
+                    .update({ host_vote: value })
+                    .eq('id', targetTicketId)
+            }
 
             // Recalculate average if already revealed or viewing completed ticket
             if ((isRevealed || isViewingCompleted) && targetTicketId) {
@@ -497,6 +546,11 @@ export default function Room() {
 
     // Navigate to a ticket in the sidebar
     const handleViewTicket = async (ticketId) => {
+        // Immediately clear stale state so the UI never shows the previous
+        // ticket's vote while the DB fetch is in-flight.
+        setMyVote(null)
+        setVotes({})
+
         if (ticketId === currentTicketId) {
             // Snap back to the live active ticket
             setViewingTicketId(null)
@@ -520,8 +574,8 @@ export default function Room() {
             await fetchVotesForTicket(ticketId)
             setIsRevealed(true)
         } else {
-            // Pending/active ticket that isn't the current one
-            // Only load the viewer's own vote — hide everyone else's
+            // Pending/active ticket that isn't the current one.
+            // Load the viewer's own saved vote (if any) — hide everyone else's.
             const voteMap = {}
             if (myParticipantId) {
                 const { data: myVoteData } = await supabase
@@ -534,9 +588,8 @@ export default function Room() {
                 if (myVoteData) {
                     voteMap[myParticipantId] = myVoteData.value
                     setMyVote(myVoteData.value)
-                } else {
-                    setMyVote(null)
                 }
+                // else: no prior vote → myVote stays null (already cleared above)
             }
             // Host viewing a non-current pending ticket — load host vote from ticket table
             if (isHost) {
@@ -548,9 +601,8 @@ export default function Room() {
                 if (ticketData?.host_vote !== null && ticketData?.host_vote !== undefined) {
                     voteMap.host = ticketData.host_vote
                     setMyVote(ticketData.host_vote)
-                } else {
-                    setMyVote(null)
                 }
+                // else: no prior host vote → myVote stays null (already cleared above)
             }
             setVotes(voteMap)
             setIsRevealed(false)
@@ -579,6 +631,43 @@ export default function Room() {
                 .eq('id', participantId)
         } finally {
             setRemovingId(null)
+        }
+    }
+
+    // Handle adding a new ticket (host only)
+    const handleAddTicket = async (e) => {
+        e.preventDefault()
+        if (!newTicketId.trim()) return
+        setIsSubmittingTicket(true)
+
+        try {
+            const newPosition = tickets.length > 0 ? Math.max(...tickets.map(t => t.position)) + 1 : 0
+            const isFirstTicket = tickets.length === 0
+
+            const { data } = await supabase
+                .from('tickets')
+                .insert([{
+                    room_id: roomId,
+                    ticket_id: newTicketId.trim(),
+                    description: newTicketDesc.trim(),
+                    position: newPosition,
+                    status: isFirstTicket ? 'active' : 'pending'
+                }])
+                .select()
+                .single()
+                
+            if (data && isFirstTicket) {
+                await supabase
+                    .from('rooms')
+                    .update({ current_ticket_id: data.id })
+                    .eq('id', roomId)
+            }
+
+            setIsAddingTicket(false)
+            setNewTicketId('')
+            setNewTicketDesc('')
+        } finally {
+            setIsSubmittingTicket(false)
         }
     }
 
@@ -679,13 +768,22 @@ export default function Room() {
                             </span>
                         )}
                         {isHost && (
-                            <button
-                                onClick={copyLink}
-                                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 border border-white/20 text-slate-300 hover:text-white hover:bg-white/20 transition-all text-xs font-medium"
-                            >
-                                {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                                {copied ? 'Copied!' : 'Invite Link'}
-                            </button>
+                            <>
+                                <button
+                                    onClick={() => setIsAddingTicket(!isAddingTicket)}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-500/10 border border-indigo-500/20 text-indigo-300 hover:text-white hover:bg-indigo-500/20 transition-all text-xs font-medium"
+                                >
+                                    <Plus className="w-3.5 h-3.5" />
+                                    <span className="hidden sm:inline">Add Ticket</span>
+                                </button>
+                                <button
+                                    onClick={copyLink}
+                                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-white/10 border border-white/20 text-slate-300 hover:text-white hover:bg-white/20 transition-all text-xs font-medium"
+                                >
+                                    {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                                    <span className="hidden sm:inline">{copied ? 'Copied!' : 'Invite Link'}</span>
+                                </button>
+                            </>
                         )}
                     </div>
                 </div>
@@ -693,6 +791,44 @@ export default function Room() {
 
             {/* Main Content */}
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
+                
+                {/* Global Add Ticket Form for Hosts */}
+                {isHost && isAddingTicket && (
+                    <div className="lg:hidden w-full p-4 border-b border-white/10 bg-slate-900/50 backdrop-blur-md">
+                        <form onSubmit={handleAddTicket} className="max-w-md mx-auto p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                            <input 
+                                type="text" 
+                                placeholder="Ticket ID (e.g. PROJ-123)"
+                                value={newTicketId}
+                                onChange={(e) => setNewTicketId(e.target.value)}
+                                className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                autoFocus
+                            />
+                            <textarea 
+                                placeholder="Description (optional)"
+                                value={newTicketDesc}
+                                onChange={(e) => setNewTicketDesc(e.target.value)}
+                                className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none h-20"
+                            />
+                            <div className="flex gap-2">
+                                <button 
+                                    type="button"
+                                    onClick={() => setIsAddingTicket(false)}
+                                    className="flex-1 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-medium transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button 
+                                    type="submit"
+                                    disabled={!newTicketId.trim() || isSubmittingTicket}
+                                    className="flex-1 flex justify-center items-center px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors disabled:opacity-50"
+                                >
+                                    {isSubmittingTicket ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Add'}
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                )}
                 {/* Participants Sidebar - Left */}
                 <aside className="lg:w-64 border-b lg:border-b-0 lg:border-r border-white/10 p-4 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
                     <div className="flex items-center gap-2 text-slate-400 mb-3">
@@ -895,15 +1031,54 @@ export default function Room() {
                 </div>
 
                 {/* Tickets Sidebar - Right */}
-                {tickets.length > 0 && (
+                {(tickets.length > 0 || isHost) && (
                     <aside className="lg:w-72 border-t lg:border-t-0 lg:border-l border-white/10 overflow-y-auto" style={{ maxHeight: 'calc(100vh - 200px)' }}>
                         <div className="p-4">
-                            <div className="flex items-center gap-2 text-slate-400 mb-3">
-                                <Hash className="w-4 h-4" />
-                                <span className="text-xs font-medium uppercase tracking-wider">
-                                    Tickets ({completedCount}/{tickets.length})
-                                </span>
+                            <div className="flex items-center justify-between text-slate-400 mb-3">
+                                <div className="flex items-center gap-2">
+                                    <Hash className="w-4 h-4" />
+                                    <span className="text-xs font-medium uppercase tracking-wider">
+                                        Tickets ({completedCount}/{tickets.length})
+                                    </span>
+                                </div>
                             </div>
+                            
+                            {/* Standard Add form for Desktop Sidebar */}
+                            {isHost && isAddingTicket && (
+                                <form onSubmit={handleAddTicket} className="hidden lg:block mb-4 p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                                    <input 
+                                        type="text" 
+                                        placeholder="Ticket ID (e.g. PROJ-123)"
+                                        value={newTicketId}
+                                        onChange={(e) => setNewTicketId(e.target.value)}
+                                        className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
+                                        autoFocus
+                                    />
+                                    <textarea 
+                                        placeholder="Description (optional)"
+                                        value={newTicketDesc}
+                                        onChange={(e) => setNewTicketDesc(e.target.value)}
+                                        className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none h-20"
+                                    />
+                                    <div className="flex gap-2">
+                                        <button 
+                                            type="button"
+                                            onClick={() => setIsAddingTicket(false)}
+                                            className="flex-1 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-medium transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button 
+                                            type="submit"
+                                            disabled={!newTicketId.trim() || isSubmittingTicket}
+                                            className="flex-1 flex justify-center items-center px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors disabled:opacity-50"
+                                        >
+                                            {isSubmittingTicket ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : 'Add'}
+                                        </button>
+                                    </div>
+                                </form>
+                            )}
+
                             <div className="space-y-1.5">
                                 {tickets.map((ticket) => {
                                     const isActive = ticket.id === currentTicketId
