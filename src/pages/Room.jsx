@@ -215,7 +215,7 @@ export default function Room() {
                 if (room.host_id) {
                     supabase.from('app_users').select('name').eq('id', room.host_id).single()
                         .then(({ data: hostUser }) => { if (hostUser) setHostName(hostUser.name) })
-                        .catch(() => {})
+                        .catch(() => { })
                 }
             }
 
@@ -279,7 +279,7 @@ export default function Room() {
                         setViewingTicketId(null) // snap back to active ticket
                         setMyVote(null)
                         setVotes({})
-                        
+
                         if (ticketActuallyChanged && newTicketId) {
                             // Immediately fetch pre-existing votes for the new ticket
                             supabase
@@ -296,12 +296,12 @@ export default function Room() {
                                             })
                                             return copy
                                         })
-                                        
+
                                         const mine = allVotes.find(v => v.participant_id === myParticipantId)
                                         if (mine) setMyVote(mine.value)
                                     }
                                 })
-                            
+
                             // Also fetch persistent host vote if any
                             supabase
                                 .from('tickets')
@@ -415,7 +415,7 @@ export default function Room() {
         if (isHost) {
             const updatedVotes = { ...votes, host: value }
             setVotes(updatedVotes)
-            
+
             if (targetTicketId === currentTicketId || !targetTicketId) {
                 await supabase
                     .from('rooms')
@@ -655,7 +655,7 @@ export default function Room() {
                 }])
                 .select()
                 .single()
-                
+
             if (data && isFirstTicket) {
                 await supabase
                     .from('rooms')
@@ -791,34 +791,34 @@ export default function Room() {
 
             {/* Main Content */}
             <div className="flex-1 flex flex-col lg:flex-row overflow-hidden">
-                
+
                 {/* Global Add Ticket Form for Hosts */}
                 {isHost && isAddingTicket && (
                     <div className="lg:hidden w-full p-4 border-b border-white/10 bg-slate-900/50 backdrop-blur-md">
                         <form onSubmit={handleAddTicket} className="max-w-md mx-auto p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
-                            <input 
-                                type="text" 
+                            <input
+                                type="text"
                                 placeholder="Ticket ID (e.g. PROJ-123)"
                                 value={newTicketId}
                                 onChange={(e) => setNewTicketId(e.target.value)}
                                 className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                                 autoFocus
                             />
-                            <textarea 
+                            <textarea
                                 placeholder="Description (optional)"
                                 value={newTicketDesc}
                                 onChange={(e) => setNewTicketDesc(e.target.value)}
                                 className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none h-20"
                             />
                             <div className="flex gap-2">
-                                <button 
+                                <button
                                     type="button"
                                     onClick={() => setIsAddingTicket(false)}
                                     className="flex-1 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-medium transition-colors"
                                 >
                                     Cancel
                                 </button>
-                                <button 
+                                <button
                                     type="submit"
                                     disabled={!newTicketId.trim() || isSubmittingTicket}
                                     className="flex-1 flex justify-center items-center px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors disabled:opacity-50"
@@ -988,7 +988,7 @@ export default function Room() {
                                         className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-all ${isTicketLocked
                                             ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-300'
                                             : 'bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                                        }`}
+                                            }`}
                                     >
                                         {isTicketLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
                                         {isTicketLocked ? 'Unlock Scores' : 'Lock Scores'}
@@ -1022,7 +1022,7 @@ export default function Room() {
                             className={`flex items-center gap-2 px-5 py-3 rounded-xl font-semibold transition-all ${isTicketLocked
                                 ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-300'
                                 : 'bg-amber-500/10 border border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                            }`}
+                                }`}
                         >
                             {isTicketLocked ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
                             {isTicketLocked ? 'Unlock Scores' : 'Lock Scores'}
@@ -1042,33 +1042,33 @@ export default function Room() {
                                     </span>
                                 </div>
                             </div>
-                            
+
                             {/* Standard Add form for Desktop Sidebar */}
                             {isHost && isAddingTicket && (
                                 <form onSubmit={handleAddTicket} className="hidden lg:block mb-4 p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
-                                    <input 
-                                        type="text" 
+                                    <input
+                                        type="text"
                                         placeholder="Ticket ID (e.g. PROJ-123)"
                                         value={newTicketId}
                                         onChange={(e) => setNewTicketId(e.target.value)}
                                         className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                                         autoFocus
                                     />
-                                    <textarea 
+                                    <textarea
                                         placeholder="Description (optional)"
                                         value={newTicketDesc}
                                         onChange={(e) => setNewTicketDesc(e.target.value)}
                                         className="w-full px-3 py-2 rounded-lg bg-white/10 border border-white/20 text-white text-sm placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-indigo-500 resize-none h-20"
                                     />
                                     <div className="flex gap-2">
-                                        <button 
+                                        <button
                                             type="button"
                                             onClick={() => setIsAddingTicket(false)}
                                             className="flex-1 px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-medium transition-colors"
                                         >
                                             Cancel
                                         </button>
-                                        <button 
+                                        <button
                                             type="submit"
                                             disabled={!newTicketId.trim() || isSubmittingTicket}
                                             className="flex-1 flex justify-center items-center px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-medium transition-colors disabled:opacity-50"
@@ -1175,3 +1175,4 @@ export default function Room() {
         </div>
     )
 }
+
